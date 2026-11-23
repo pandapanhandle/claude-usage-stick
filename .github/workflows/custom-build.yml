@@ -1,8 +1,12 @@
 name: Build custom firmware (T-Display S3)
 
-# Applies custom.patch on top of the upstream source, builds the tdisplay-s3
-# firmware, and force-pushes the images plus the build log to the "builds"
-# branch so they can be fetched without an Actions login.
+# Builds the official claude-usage-stick source at UPSTREAM_REF with
+# custom.patch applied, then force-pushes the images plus the build log to
+# the "builds" branch.
+#
+# To move to a newer official release: change UPSTREAM_REF below (e.g. to
+# v3.2.0) and commit. If the patch no longer applies, the "Apply custom
+# changes" step fails and build.log on the builds branch says where.
 on:
   push:
     branches: [custom]
@@ -10,6 +14,14 @@ on:
       - custom.patch
       - .github/workflows/custom-build.yml
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Official tag/branch/commit to build on (blank = UPSTREAM_REF)"
+        required: false
+
+env:
+  UPSTREAM_REPO: oauramos/claude-usage-stick
+  UPSTREAM_REF: v3.1.0
 
 permissions:
   contents: write
@@ -18,22 +30,35 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out this branch (for custom.patch)
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Check out the official source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ github.event.inputs.upstream_ref || env.UPSTREAM_REF }}
+          path: src
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Apply custom changes
+        working-directory: src
         run: |
-          git apply custom.patch
-          python3 web/panel/build.py
+          echo "Official source: ${UPSTREAM_REPO} @ $(git describe --tags --always)" | tee ../build.log
+          git apply --verbose ../ours/custom.patch 2>&1 | tee -a ../build.log
+          python3 web/panel/build.py | tee -a ../build.log
 
       - name: Install PlatformIO
         run: pip install platformio
 
       - name: Build tdisplay-s3
-        run: pio run -e tdisplay-s3 2>&1 | tee build.log
+        working-directory: src
+        run: pio run -e tdisplay-s3 2>&1 | tee -a ../build.log
 
       - name: Publish to the builds branch
         if: always()
@@ -41,11 +66,12 @@ jobs:
           mkdir -p /tmp/out
           cp build.log /tmp/out/ 2>/dev/null || echo "no log" > /tmp/out/build.log
           for f in bootloader partitions firmware; do
-            cp ".pio/build/tdisplay-s3/$f.bin" /tmp/out/ 2>/dev/null || true
+            cp "src/.pio/build/tdisplay-s3/$f.bin" /tmp/out/ 2>/dev/null || true
           done
           cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin /tmp/out/ 2>/dev/null || true
           (cd /tmp/out && sha256sum *.bin > SHA256SUMS 2>/dev/null || true)
-          echo "${GITHUB_SHA}" > /tmp/out/SOURCE_COMMIT
+          echo "custom: ${GITHUB_SHA}" > /tmp/out/SOURCE_COMMIT
+          echo "official: ${UPSTREAM_REPO} @ $(git -C src describe --tags --always 2>/dev/null)" >> /tmp/out/SOURCE_COMMIT
           cd /tmp/out
           git init -q -b builds
           git config user.name "github-actions"
