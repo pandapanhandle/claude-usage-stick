@@ -1,0 +1,55 @@
+name: Build custom firmware (T-Display S3)
+
+# Applies custom.patch on top of the upstream source, builds the tdisplay-s3
+# firmware, and force-pushes the images plus the build log to the "builds"
+# branch so they can be fetched without an Actions login.
+on:
+  push:
+    branches: [custom]
+    paths:
+      - custom.patch
+      - .github/workflows/custom-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply custom changes
+        run: |
+          git apply custom.patch
+          python3 web/panel/build.py
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build tdisplay-s3
+        run: pio run -e tdisplay-s3 2>&1 | tee build.log
+
+      - name: Publish to the builds branch
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          cp build.log /tmp/out/ 2>/dev/null || echo "no log" > /tmp/out/build.log
+          for f in bootloader partitions firmware; do
+            cp ".pio/build/tdisplay-s3/$f.bin" /tmp/out/ 2>/dev/null || true
+          done
+          cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin /tmp/out/ 2>/dev/null || true
+          (cd /tmp/out && sha256sum *.bin > SHA256SUMS 2>/dev/null || true)
+          echo "${GITHUB_SHA}" > /tmp/out/SOURCE_COMMIT
+          cd /tmp/out
+          git init -q -b builds
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Build of ${GITHUB_SHA::7} ($(date -u +%FT%TZ))"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git" builds
