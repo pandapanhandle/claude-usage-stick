@@ -1,0 +1,1019 @@
+diff --git a/platformio.ini b/platformio.ini
+index 2f1fe21..f34792e 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -111,6 +111,7 @@ lib_deps =
+ 
+ build_flags =
+     -DBOARD_TDISPLAY_S3
++    -DCUSTOM_SY
+     -DMANGO_UI
+     -DDUST_UI
+     -DBOARD_HAS_PSRAM
+diff --git a/src/app_state.h b/src/app_state.h
+index 445a012..8997686 100644
+--- a/src/app_state.h
++++ b/src/app_state.h
+@@ -16,3 +16,6 @@ extern ModelStatus   g_models;
+ extern char          g_token[256];      // decrypted OAuth token, RAM only
+ extern bool          g_unlocked;        // PIN accepted (buttons or web)
+ extern unsigned long g_lastFetchMs;
++#ifdef CUSTOM_SY
++extern bool          g_lastFetchOk;     // the most recent fetch brought new numbers
++#endif
+diff --git a/src/config.h b/src/config.h
+index dce4186..a778a81 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -1,7 +1,11 @@
+ #pragma once
+ 
+ // ── Firmware version ─────────────────────────────────────
++#ifdef CUSTOM_SY
++#define FW_VERSION              "3.1.0-custom.1"  // custom build (no-PIN boot, auto DST, OTA)
++#else
+ #define FW_VERSION              "3.1.0"  // Dust — shown on the boot screen
++#endif
+ 
+ // ── Polling ──────────────────────────────────────────────
+ #define DEFAULT_POLL_SEC        120
+@@ -66,6 +70,17 @@
+ // ── NVS ──────────────────────────────────────────────────
+ #define NVS_NAMESPACE           "claude"
+ 
++// ── Custom build (CUSTOM_SY) ─────────────────────────────
++// Passphrase for the device-bound auto-unlock copy of the token. The real key
++// also mixes in the chip's MAC (crypto.cpp salt), so the copy only decrypts on
++// this board. This is convenience, not secrecy: anyone holding the board can
++// recover the token, which is the trade the owner chose for PIN-free boots.
++#define AUTO_UNLOCK_PASS        "custom-sy/auto-unlock/v1"
++#define STALE_GRACE_SEC         90       // stale once older than 2 polls + this
++#define USAGE_CACHE_MAX_AGE_S   (15 * 60)  // rewrite the cache at least this often while values hold
++#define WARN_PCT                75.0f    // bars turn amber
++#define CRIT_PCT                90.0f    // bars turn red
++
+ // ── Feature flags (set via build_flags in platformio.ini) ────
+ // MANGO_UI — the "Mango" dashboard: model-status mascots from status.claude.com,
+ //   battery + WiFi-signal icons in the header, dashboard-styled PIN screen, and
+diff --git a/src/custom.cpp b/src/custom.cpp
+new file mode 100644
+index 0000000..94ffc64
+--- /dev/null
++++ b/src/custom.cpp
+@@ -0,0 +1,76 @@
++#include "custom.h"
++
++#ifdef CUSTOM_SY
++
++#include <Arduino.h>
++#include <string.h>
++#include <time.h>
++#include <math.h>
++#include "config.h"
++#include "crypto.h"
++#include "settings.h"
++
++static const char*    KEY_AUTO    = "ablob";
++static const char*    KEY_CACHE   = "ucache";
++static const uint32_t CACHE_MAGIC = 0x55434331;   // "UCC1"
++
++// The token the stored auto-unlock copy currently holds (RAM only), so repeat
++// panel logins don't rewrite flash.
++static char s_rememberedTok[256] = "";
++
++bool customAutoUnlockLoad(char* tokOut, size_t tokMax) {
++    EncryptedBlob b;
++    if (settingsGetBlob(KEY_AUTO, &b, sizeof(b)) != sizeof(b)) return false;
++    if (!decryptToken(b, AUTO_UNLOCK_PASS, tokOut, tokMax)) return false;
++    strlcpy(s_rememberedTok, tokOut, sizeof(s_rememberedTok));
++    return true;
++}
++
++void customAutoUnlockRemember(const char* token) {
++    if (!token || !token[0]) return;
++    if (strcmp(token, s_rememberedTok) == 0) return;
++    EncryptedBlob b;
++    if (!encryptToken(token, AUTO_UNLOCK_PASS, b)) return;
++    settingsPutBlob(KEY_AUTO, &b, sizeof(b));
++    strlcpy(s_rememberedTok, token, sizeof(s_rememberedTok));
++    memset(&b, 0, sizeof(b));
++}
++
++bool customTimeValid() {
++    return time(nullptr) > 1700000000;   // Nov 2023 — anything earlier is an unsynced clock
++}
++
++bool customCacheLoad(UsageData& out, uint32_t& fetchedEpoch) {
++    UsageCache c;
++    if (settingsGetBlob(KEY_CACHE, &c, sizeof(c)) != sizeof(c)) return false;
++    if (c.magic != CACHE_MAGIC || c.fetchedEpoch < 1700000000) return false;
++    memset(&out, 0, sizeof(out));
++    out.h5 = c.h5;
++    out.d7 = c.d7;
++    out.h5ResetEpoch = c.h5ResetEpoch;
++    out.d7ResetEpoch = c.d7ResetEpoch;
++    out.ok = true;
++    fetchedEpoch = c.fetchedEpoch;
++    return true;
++}
++
++void customCacheSave(const UsageData& u, uint32_t fetchedEpoch) {
++    if (!u.ok || fetchedEpoch < 1700000000) return;
++    static UsageCache last = {};
++    bool moved = lroundf(u.h5) != lroundf(last.h5) || lroundf(u.d7) != lroundf(last.d7) ||
++                 u.h5ResetEpoch != last.h5ResetEpoch || u.d7ResetEpoch != last.d7ResetEpoch;
++    bool old = fetchedEpoch - last.fetchedEpoch >= USAGE_CACHE_MAX_AGE_S;
++    if (last.magic == CACHE_MAGIC && !moved && !old) return;
++
++    UsageCache c;
++    c.magic = CACHE_MAGIC;
++    c.h5 = u.h5;
++    c.d7 = u.d7;
++    c.h5ResetEpoch = u.h5ResetEpoch;
++    c.d7ResetEpoch = u.d7ResetEpoch;
++    c.fetchedEpoch = fetchedEpoch;
++    settingsPutBlob(KEY_CACHE, &c, sizeof(c));
++    last = c;
++}
++
++#endif // CUSTOM_SY
+diff --git a/src/custom.h b/src/custom.h
+new file mode 100644
+index 0000000..b43752b
+--- /dev/null
++++ b/src/custom.h
+@@ -0,0 +1,37 @@
++#pragma once
++// Custom build (CUSTOM_SY): PIN-free boot, cached usage for instant wake-up,
++// and the stale-data bookkeeping the dashboard reads.
++//
++// The PIN still guards the web panel and token changes; only the boot screen's
++// PIN prompt goes away. To do that the token is kept a second time, encrypted
++// with a key bound to this chip (AUTO_UNLOCK_PASS + MAC salt) instead of the PIN.
++#include <stdint.h>
++#include <stddef.h>
++#include "api.h"
++
++#ifdef CUSTOM_SY
++
++// Decrypts the device-bound copy into tokOut. False when there is none yet
++// (first boot after flashing) or it no longer decrypts.
++bool customAutoUnlockLoad(char* tokOut, size_t tokMax);
++
++// Saves the device-bound copy of a token that was just proven with the PIN.
++// Skips the flash write when the stored copy already holds this token.
++void customAutoUnlockRemember(const char* token);
++
++// Last good reading, persisted so a cold boot can show numbers at once.
++struct UsageCache {
++    uint32_t magic;
++    float    h5, d7;
++    uint32_t h5ResetEpoch, d7ResetEpoch;
++    uint32_t fetchedEpoch;   // wall-clock time the numbers were fetched
++};
++
++bool customCacheLoad(UsageData& out, uint32_t& fetchedEpoch);
++// Rate-limited: writes only when the numbers moved or the copy is old.
++void customCacheSave(const UsageData& u, uint32_t fetchedEpoch);
++
++// True once NTP has set a plausible wall clock.
++bool customTimeValid();
++
++#endif
+diff --git a/src/main.cpp b/src/main.cpp
+index 3421bdc..7ff5384 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -34,6 +34,11 @@
+ #ifdef MANGO_UI
+ #include "status.h"
+ #endif
++#ifdef CUSTOM_SY
++#include "custom.h"
++#include <string.h>
++#include <time.h>
++#endif
+ 
+ Settings      g_settings;
+ UsageData     g_usage;
+@@ -43,6 +48,29 @@ ModelStatus   g_models = {true, true, true, true, false};
+ char          g_token[256];
+ bool          g_unlocked = false;
+ unsigned long g_lastFetchMs = 0;
++#ifdef CUSTOM_SY
++bool          g_lastFetchOk = false;
++static bool     s_haveGood   = false;   // g_usage holds real numbers (fresh or cached)
++static bool     s_bootCached = false;   // showing the flash copy until the first fetch
++static uint32_t s_dataEpoch  = 0;       // wall-clock time of the numbers on screen
++static char     s_lastErr[64] = "";
++
++// Header notice + dimming: say why the numbers on screen might be old.
++// Returns true when the bars' dimming changed (the screen needs a redraw).
++static bool updateNotice() {
++    if (!s_haveGood) return uiSetNotice(nullptr, false);   // error screen covers it
++    bool stale = false;
++    if (s_dataEpoch && customTimeValid()) {
++        uint32_t age = (uint32_t)time(nullptr) - s_dataEpoch;
++        stale = age > (uint32_t)g_settings.pollSec * 2 + STALE_GRACE_SEC;
++    }
++    const char* note = nullptr;
++    if (strcmp(s_lastErr, "auth_failed") == 0) note = "TOKEN EXPIRED - SEE PANEL";
++    else if (s_bootCached)                     note = "UPDATING...";
++    else if (stale)                            note = "NO NEW DATA - RETRYING";
++    return uiSetNotice(note, stale || note != nullptr);
++}
++#endif
+ 
+ // ── PIN Entry (blocks until 4 digits confirmed) ────────
+ // Returns false if a web login unlocked the device mid-entry (T-Display S3):
+@@ -114,7 +142,27 @@ static void refresh() {
+     if (WiFi.status() != WL_CONNECTED) {
+         connectWiFi(g_settings.ssid, g_settings.wifipass);
+     }
++#ifdef CUSTOM_SY
++    // A failed fetch keeps the last good numbers on screen (dimmed once stale)
++    // instead of swapping the dashboard for an error page.
++    UsageData fresh = g_usage;
++    g_lastFetchOk = fetchUsage(g_token, fresh);
++    if (g_lastFetchOk) {
++        g_usage = fresh;
++        s_haveGood = true;
++        s_lastErr[0] = '\0';
++        s_dataEpoch = customTimeValid() ? (uint32_t)time(nullptr) : 0;
++        uiMarkData(s_dataEpoch, millis());
++        customCacheSave(g_usage, s_dataEpoch);
++    } else {
++        strlcpy(s_lastErr, fresh.error, sizeof(s_lastErr));
++        if (!s_haveGood) g_usage = fresh;   // nothing to keep — show the error
++    }
++    s_bootCached = false;
++    updateNotice();
++#else
+     fetchUsage(g_token, g_usage);
++#endif
+ #ifdef MANGO_UI
+     fetchModelStatus(g_models);   // failure keeps last-known state
+     uiSetModelStatus(g_models);
+@@ -169,6 +217,9 @@ static void unlockPhase(int progressPct) {
+     panelConsumeUnlock();
+ #endif
+     g_unlocked = true;
++#ifdef CUSTOM_SY
++    customAutoUnlockRemember(g_token);   // next boot skips the PIN
++#endif
+     // Drain stray button edges so nothing phantom-taps the dashboard.
+     halUpdate();
+     halBtnAWasPressed();
+@@ -199,7 +250,7 @@ static void netPhase() {
+ 
+     uiBootProgress(70, "Syncing time...");
+     syncTime();
+-    settingsApplyTZ(g_settings.tzMin);
++    settingsApplyZone(g_settings);
+ 
+     char url[40];
+     snprintf(url, sizeof(url), "http://%s", WiFi.localIP().toString().c_str());
+@@ -218,7 +269,7 @@ static void netPhaseLegacy() {
+ 
+     uiBootProgress(90, "Syncing time...");
+     syncTime();
+-    settingsApplyTZ(g_settings.tzMin);
++    settingsApplyZone(g_settings);
+ }
+ #endif
+ 
+@@ -274,10 +325,34 @@ void setup() {
+ #endif
+ 
+ #ifdef DUST_UI
++#ifdef CUSTOM_SY
++    // PIN-free boot: the device-bound token copy unlocks straight away, and the
++    // last saved numbers go on screen before WiFi is even up.
++    if (customAutoUnlockLoad(g_token, sizeof(g_token))) {
++        g_unlocked = true;
++        uint32_t cachedAt;
++        if (customCacheLoad(g_usage, cachedAt)) {
++            s_haveGood   = true;
++            s_bootCached = true;
++            s_dataEpoch  = cachedAt;
++            uiMarkData(cachedAt, 0);
++            uiSetHeaderLabel(g_settings.devName);
++            screensInit();
++            updateNotice();
++            screensShow(SCR_DASH);
++            uiSetQuietBoot(true);   // no boot/progress screens over the numbers
++        }
++    }
++#endif
+     netPhase();
+     uiBootProgress(78, "Preparing storage...");
+     historyInit();   // first boot formats the data partition (~1-3s)
++#ifdef CUSTOM_SY
++    if (!g_unlocked) unlockPhase(85);
++    uiSetQuietBoot(true);   // later WiFi reconnects keep the dashboard up
++#else
+     unlockPhase(85);
++#endif
+     screensInit();
+ #else
+     unlockPhase(60);
+@@ -400,7 +475,17 @@ void loop() {
+ 
+ #ifdef DUST_UI
+     screensTick();                        // carousel dwell + 10s header beat + clock minute
++#ifdef CUSTOM_SY
++    // News is fetched only while its screen is enabled in the panel.
++    if ((g_settings.scrMask & (1 << SCR_NEWS)) && newsTick()) screensOnNews();
++    static unsigned long lastNoticeMs = 0;
++    if (millis() - lastNoticeMs > 10000) {
++        lastNoticeMs = millis();
++        if (updateNotice()) screensShow(screensCurrent());   // dim / undim the bars now
++    }
++#else
+     if (newsTick()) screensOnNews();      // blocks 2-5s only when a fetch is due
++#endif
+ #else
+     static unsigned long lastRedraw = 0;
+     if (millis() - lastRedraw > 10000) {
+diff --git a/src/panel.cpp b/src/panel.cpp
+index 0910b45..3e61311 100644
+--- a/src/panel.cpp
++++ b/src/panel.cpp
+@@ -18,6 +18,10 @@
+ #include "history.h"
+ #include "news.h"
+ #include "panel_html.h"
++#ifdef CUSTOM_SY
++#include "custom.h"
++#include <Update.h>
++#endif
+ 
+ // ── Handler rules (single-threaded reentrancy contract) ──────────────────
+ // Handlers execute inside handleClient(), in whichever stack frame called
+@@ -179,6 +183,9 @@ static void handleLogin() {
+ 
+     bool wasLocked = !g_unlocked;
+     strlcpy(g_token, tmp, sizeof(g_token));
++#ifdef CUSTOM_SY
++    customAutoUnlockRemember(g_token);   // PIN proven — refresh the PIN-free boot copy
++#endif
+     memset(tmp, 0, sizeof(tmp));
+     if (wasLocked) s_unlockPending = true;   // boot phase consumes on unwind
+ 
+@@ -220,7 +227,11 @@ static void handleState() {
+     if (!requireAuth()) return;
+     JsonDocument d;
+     d["fw"]        = FW_VERSION;
++#ifdef CUSTOM_SY
++    d["codename"]  = "Dust \u00b7 custom";
++#else
+     d["codename"]  = "Dust";
++#endif
+     d["hostname"]  = s_hostname;
+     d["ip"]        = WiFi.localIP().toString();
+     d["rssi"]      = WiFi.RSSI();
+@@ -252,6 +263,7 @@ static void handleState() {
+     c["brightness"] = g_settings.brightness;
+     c["poll_sec"]   = g_settings.pollSec;
+     c["tz_min"]     = g_settings.tzMin;
++    c["tz_posix"]   = g_settings.tzPosix;
+     c["dev_name"]   = g_settings.devName;
+     c["flip"]       = g_settings.flip;
+     c["ui_mode"]    = g_settings.uiMode;
+@@ -288,9 +300,26 @@ static void handleSettings() {
+     }
+     if (body["tz_min"].is<int>()) {
+         g_settings.tzMin = constrain(body["tz_min"].as<int>(), -840, 840);
+-        settingsApplyTZ(g_settings.tzMin);
+         settingsPutInt("tz_min", g_settings.tzMin);
+         applied["tz_min"] = g_settings.tzMin;
++        if (body["tz_posix"].isNull()) {           // a plain offset replaces any DST rule
++            g_settings.tzPosix[0] = '\0';
++            settingsPutStr("tz_posix", "");
++        }
++    }
++    if (body["tz_posix"].is<const char*>()) {
++        const char* tz = body["tz_posix"] | "";
++        if (!settingsTzPosixValid(tz)) {
++            sendErr(400, "bad_tz");
++            return;
++        }
++        strlcpy(g_settings.tzPosix, tz, sizeof(g_settings.tzPosix));
++        settingsPutStr("tz_posix", g_settings.tzPosix);
++        applied["tz_posix"] = g_settings.tzPosix;
++    }
++    if (!body["tz_min"].isNull() || !body["tz_posix"].isNull()) {
++        settingsApplyZone(g_settings);
++        s_actions |= PANEL_ACT_REDRAW;             // clock + countdowns follow the new zone
+     }
+     if (body["dev_name"].is<const char*>()) {
+         strlcpy(g_settings.devName, body["dev_name"] | "", sizeof(g_settings.devName));
+@@ -448,6 +477,9 @@ static void handleToken() {
+     g_settings.blob    = nb;
+     g_settings.hasBlob = true;
+     strlcpy(g_token, token, sizeof(g_token));
++#ifdef CUSTOM_SY
++    customAutoUnlockRemember(g_token);   // keep the PIN-free boot copy on the new token
++#endif
+ 
+     // Sanctioned inline probe (1–3s): the user asked for a verdict.
+     fetchUsage(g_token, g_usage);
+@@ -525,6 +557,94 @@ static void handleReset() {
+     sendJson(200, d);
+ }
+ 
++#ifdef CUSTOM_SY
++// ── Wireless firmware update ─────────────────────────────────────────────
++// Multipart upload of firmware.bin into the idle OTA slot (default_16MB.csv
++// has app0/app1); the boot slot switches only after the whole image verifies,
++// so a dropped upload leaves the running firmware untouched. Auth = a PIN
++// login session + an X-OTA header (a cross-site form can set neither the
++// SameSite=Strict cookie nor custom headers). The chip id in the image header
++// must be ESP32-S3 so a build for another board can't be installed by mistake.
++static bool   s_otaActive = false;
++static bool   s_otaOk     = false;
++static size_t s_otaBytes  = 0;
++static char   s_otaErr[40] = "";
++
++static void otaFail(const char* why) {
++    if (s_otaActive) Update.abort();
++    s_otaActive = false;
++    if (!s_otaErr[0]) strlcpy(s_otaErr, why, sizeof(s_otaErr));
++}
++
++static void handleOtaUpload() {
++    HTTPUpload& up = s_server.upload();
++    switch (up.status) {
++        case UPLOAD_FILE_START:
++            s_otaOk = false;
++            s_otaActive = false;
++            s_otaBytes = 0;
++            s_otaErr[0] = '\0';
++            if (!findSession() || s_server.header("X-OTA") != "1") {
++                strlcpy(s_otaErr, "auth", sizeof(s_otaErr));
++                return;
++            }
++            if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
++                snprintf(s_otaErr, sizeof(s_otaErr), "begin_failed_%u", (unsigned)Update.getError());
++                return;
++            }
++            s_otaActive = true;
++            break;
++        case UPLOAD_FILE_WRITE:
++            if (!s_otaActive) return;
++            if (s_otaBytes == 0) {
++                // esp_image_header_t: magic 0xE9 at 0, chip_id (u16 LE) at 12.
++                uint16_t chip = up.currentSize >= 14 ? (up.buf[12] | (up.buf[13] << 8)) : 0xFFFF;
++                if (up.currentSize < 14 || up.buf[0] != 0xE9 || chip != 9 /* ESP32-S3 */) {
++                    otaFail("not_esp32s3_image");
++                    return;
++                }
++            }
++            if (Update.write(up.buf, up.currentSize) != up.currentSize) {
++                snprintf(s_otaErr, sizeof(s_otaErr), "write_failed_%u", (unsigned)Update.getError());
++                otaFail("write_failed");
++                return;
++            }
++            s_otaBytes += up.currentSize;
++            break;
++        case UPLOAD_FILE_END:
++            if (!s_otaActive) return;
++            s_otaActive = false;
++            if (s_otaBytes > 0 && Update.end(true)) {
++                s_otaOk = true;
++            } else {
++                snprintf(s_otaErr, sizeof(s_otaErr), "verify_failed_%u", (unsigned)Update.getError());
++            }
++            break;
++        case UPLOAD_FILE_ABORTED:
++            otaFail("aborted");
++            break;
++        default:
++            break;
++    }
++}
++
++static void handleOtaDone() {
++    if (!s_otaOk) {
++        bool auth = strcmp(s_otaErr, "auth") == 0;
++        sendErr(auth ? 401 : 400, s_otaErr[0] ? s_otaErr : "no_file");
++        return;
++    }
++    s_otaOk = false;
++    s_actions |= PANEL_ACT_REBOOT;
++    s_notBeforeMs = millis() + 800;   // let the response flush first
++    JsonDocument d;
++    d["ok"]        = true;
++    d["bytes"]     = (uint32_t)s_otaBytes;
++    d["rebooting"] = true;
++    sendJson(200, d);
++}
++#endif // CUSTOM_SY
++
+ static void handleNotFound() {
+     sendErr(404, "not_found");
+ }
+@@ -537,8 +657,8 @@ void panelBegin(const char* hostname) {
+     MDNS.addService("http", "tcp", 80);
+ 
+     // WebServer only exposes headers listed here — Cookie carries the session.
+-    static const char* headerKeys[] = {"Cookie", "If-None-Match", "Content-Type"};
+-    s_server.collectHeaders(headerKeys, 3);
++    static const char* headerKeys[] = {"Cookie", "If-None-Match", "Content-Type", "X-OTA"};
++    s_server.collectHeaders(headerKeys, 4);
+ 
+     s_server.on("/", HTTP_GET, handleRoot);
+     s_server.on("/api/login", HTTP_POST, handleLogin);
+@@ -552,6 +672,9 @@ void panelBegin(const char* hostname) {
+     s_server.on("/api/reset", HTTP_POST, handleReset);
+     s_server.on("/api/history", HTTP_GET, handleHistory);
+     s_server.on("/api/news", HTTP_GET, handleNews);
++#ifdef CUSTOM_SY
++    s_server.on("/api/ota", HTTP_POST, handleOtaDone, handleOtaUpload);
++#endif
+ #ifdef PANEL_DEBUG
+     s_server.on("/api/debug/seed-history", HTTP_POST, handleSeedHistory);
+ #endif
+diff --git a/src/provision.cpp b/src/provision.cpp
+index 2d04a08..9ff9165 100644
+--- a/src/provision.cpp
++++ b/src/provision.cpp
+@@ -184,11 +184,19 @@ static void handleProvision() {
+         webServer.send(500, "text/plain", "Encryption failed.");
+         return;
+     }
++#ifdef CUSTOM_SY
++    // PIN-free boot: also keep a device-bound copy of a newly entered token.
++    EncryptedBlob autoBlob;
++    bool haveAuto = !keepBlob && encryptToken(token.c_str(), AUTO_UNLOCK_PASS, autoBlob);
++#endif
+ 
+     prefs.begin(NVS_NAMESPACE, false);
+     prefs.putString("ssid", ssid);
+     prefs.putString("wifipass", wifipass);
+     if (!keepBlob) prefs.putBytes("blob", &blob, sizeof(blob));
++#ifdef CUSTOM_SY
++    if (haveAuto) prefs.putBytes("ablob", &autoBlob, sizeof(autoBlob));
++#endif
+     if (!s_reconfig) {
+         // First-run setup records the preferences too; the reconfigure portal
+         // hides that section and leaves them untouched.
+diff --git a/src/screens.cpp b/src/screens.cpp
+index be5028f..02df0eb 100644
+--- a/src/screens.cpp
++++ b/src/screens.cpp
+@@ -58,8 +58,18 @@ void screensShow(Screen s) {
+     }
+ }
+ 
++#ifdef CUSTOM_SY
++static Screen nextEnabled(Screen from);
++#endif
++
+ void screensNext() {
++#ifdef CUSTOM_SY
++    // Button A steps through the same screens the panel enabled — a hidden
++    // screen (e.g. News) stays hidden everywhere, not just in the carousel.
++    screensShow(nextEnabled(s_current));
++#else
+     screensShow((Screen)((s_current + 1) % SCR_COUNT));
++#endif
+     armDwell();
+ }
+ 
+@@ -106,7 +116,11 @@ void screensTick() {
+ }
+ 
+ void screensOnData() {
++#ifdef CUSTOM_SY
++    if (g_lastFetchOk) historyRecord(g_usage);   // kept-but-old numbers aren't a new sample
++#else
+     historyRecord(g_usage);
++#endif
+     switch (s_current) {
+         case SCR_DASH:
+             screensShow(SCR_DASH);
+diff --git a/src/settings.cpp b/src/settings.cpp
+index 3d7a154..ca7571d 100644
+--- a/src/settings.cpp
++++ b/src/settings.cpp
+@@ -30,6 +30,8 @@ void settingsLoad(Settings& s) {
+     s.scrMask    = prefs.getUChar("scr_mask", 0x07) & 0x0F;
+     if (s.scrMask == 0) s.scrMask = 0x01;   // carousel can never be empty
+     s.mdlMask    = prefs.getUChar("mdl_mask", 0x0F) & 0x0F;
++    prefs.getString("tz_posix", s.tzPosix, sizeof(s.tzPosix));
++    if (!settingsTzPosixValid(s.tzPosix)) s.tzPosix[0] = '\0';
+     prefs.end();
+ }
+ 
+@@ -63,6 +65,41 @@ void settingsWipeAll() {
+     prefs.end();
+ }
+ 
++size_t settingsGetBlob(const char* key, void* data, size_t len) {
++    prefs.begin(NVS_NAMESPACE, true);
++    size_t n = prefs.isKey(key) ? prefs.getBytes(key, data, len) : 0;
++    prefs.end();
++    return n;
++}
++
++void settingsRemove(const char* key) {
++    prefs.begin(NVS_NAMESPACE, false);
++    if (prefs.isKey(key)) prefs.remove(key);
++    prefs.end();
++}
++
++bool settingsTzPosixValid(const char* tz) {
++    size_t n = strlen(tz);
++    if (n == 0 || n >= 48) return n == 0;
++    for (size_t i = 0; i < n; i++) {
++        char c = tz[i];
++        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++                  c == ',' || c == '.' || c == '/' || c == ':' || c == '+' || c == '-' ||
++                  c == '<' || c == '>';
++        if (!ok) return false;
++    }
++    return true;
++}
++
++void settingsApplyZone(const Settings& s) {
++    if (s.tzPosix[0]) {
++        setenv("TZ", s.tzPosix, 1);
++        tzset();
++    } else {
++        settingsApplyTZ(s.tzMin);
++    }
++}
++
+ void settingsApplyTZ(int32_t tzMin) {
+     int32_t m = -tzMin;   // POSIX sign inversion
+     char tz[16];
+diff --git a/src/settings.h b/src/settings.h
+index b94535b..bbe8783 100644
+--- a/src/settings.h
++++ b/src/settings.h
+@@ -21,6 +21,7 @@ struct Settings {
+     uint8_t       dwellS;       // u8, carousel dwell: 5/10/15/30 s
+     uint8_t       scrMask;      // u8, carousel screen set (bit per Screen)
+     uint8_t       mdlMask;      // u8, which model mascots render (bit per model)
++    char          tzPosix[48];  // str, POSIX TZ rule with DST ("" = use tzMin)
+ };
+ 
+ bool settingsIsProvisioned();
+@@ -31,6 +32,18 @@ void settingsPutStr(const char* key, const char* v);
+ void settingsPutBlob(const char* key, const void* data, size_t len);
+ void settingsWipeAll();
+ 
++// Reads a byte blob; returns the number of bytes read (0 when absent).
++size_t settingsGetBlob(const char* key, void* data, size_t len);
++void   settingsRemove(const char* key);
++
++// A POSIX TZ rule is accepted only from this charset and length, so nothing odd
++// reaches setenv() from the panel.
++bool settingsTzPosixValid(const char* tz);
++
++// Applies the saved zone: the POSIX rule (with DST) when one is set, else the
++// fixed GMT offset.
++void settingsApplyZone(const Settings& s);
++
+ // Sets the process TZ from an east-of-UTC minute offset. POSIX inverts the
+ // sign (TZ=GMT-3 means UTC+3); the inversion happens here so callers think in
+ // normal GMT± terms. Fixed offset only, no DST rules.
+diff --git a/src/ui.cpp b/src/ui.cpp
+index cc39455..ad19765 100644
+--- a/src/ui.cpp
++++ b/src/ui.cpp
+@@ -12,6 +12,12 @@ static void fmtCountdown(uint32_t epoch, char* out, size_t len) {
+     }
+     time_t now;
+     time(&now);
++#ifdef CUSTOM_SY
++    if (now < 1700000000) {   // clock not synced yet (cold boot) — don't show nonsense
++        strlcpy(out, "--", len);
++        return;
++    }
++#endif
+     int32_t diff = (int32_t)epoch - (int32_t)now;
+     if (diff <= 0) {
+         strlcpy(out, "now", len);
+@@ -338,9 +344,42 @@ static TFT_eSprite& dashTarget() {
+   #define UI_PUSH_DASH() halFlush()
+ #endif
+ 
++#ifdef CUSTOM_SY
++static bool          s_quietBoot  = false;
++static uint32_t      s_dataEpoch  = 0;
++static unsigned long s_dataMs     = 0;
++static char          s_notice[29] = "";
++static bool          s_stale      = false;
++
++void uiSetQuietBoot(bool quiet) { s_quietBoot = quiet; }
++void uiMarkData(uint32_t epoch, unsigned long ms) { s_dataEpoch = epoch; s_dataMs = ms; }
++bool uiSetNotice(const char* notice, bool stale) {
++    strlcpy(s_notice, notice ? notice : "", sizeof(s_notice));
++    bool changed = stale != s_stale;
++    s_stale = stale;
++    return changed;
++}
++
++// Seconds since the numbers on screen were fetched (not since the last try).
++static unsigned long dataAgeS(unsigned long lastFetchMs) {
++    time_t now = time(nullptr);
++    if (s_dataEpoch && now > 1700000000 && (uint32_t)now >= s_dataEpoch)
++        return (uint32_t)now - s_dataEpoch;
++    if (s_dataMs) return (millis() - s_dataMs) / 1000;
++    return (millis() - lastFetchMs) / 1000;
++}
++
++// White below WARN_PCT, amber from there, red from CRIT_PCT.
++static uint16_t barColor(float pct) {
++    if (pct >= CRIT_PCT) return C_CRIT;
++    if (pct >= WARN_PCT) return C_WARN;
++    return C_TEXT;
++}
++#else
+ static uint16_t barColor(float) {
+     return C_TEXT;
+ }
++#endif
+ 
+ // Right-aligned reset countdown that rides on a usage bar's label row (the
+ // M5StickC Plus 240x135 layout). A fixed-width slot is cleared first so a shorter
+@@ -366,6 +405,9 @@ static void drawResetSlot(GFX& g, int barX, int barW, int y, const char* reset)
+ template <class GFX>
+ static void drawBar(GFX& g, int x, int y, int w, int h, float pct, const char* label,
+                     const char* reset = nullptr, bool dim = false) {
++#ifdef CUSTOM_SY
++    if (s_stale) dim = true;   // old numbers read grey until a fetch lands
++#endif
+     const uint16_t fg = (pct < 0 || dim) ? C_DIM : barColor(pct);
+     g.setTextColor(C_TEXT, C_BG);
+     g.setTextSize(TS(1));
+@@ -447,6 +489,9 @@ static void drawHeaderLeft(GFX& g) {
+     g.setTextColor(C_TEXT, C_HEAD);
+     g.setTextSize(1);
+     g.setCursor(4, 5);
++#ifdef CUSTOM_SY
++    if (s_notice[0]) { g.printf(HDR_LEFT_FMT, s_notice); return; }
++#endif
+     g.printf(HDR_LEFT_FMT, (s_hdrShowUrl && s_netUrl[0]) ? s_netUrl : s_hdrLabel);
+ }
+ #endif // DUST_UI
+@@ -724,6 +769,17 @@ static void drawHeaderRight(GFX& g, int rssi, unsigned long ago, int batPct) {
+     g.setTextColor(C_TEXT, C_HEAD);
+     g.setTextSize(1);
+ 
++#ifdef CUSTOM_SY
++    // USB-powered build: no battery is fitted, so its reading is meaningless.
++    (void)batPct;
++    int x = SCREEN_W - 4 - 15;   // wifi icon flush right
++    drawWifiIcon(g, x, rssi);
++
++    char as[12];
++    if (ago < 120)       snprintf(as, sizeof(as), "%lus", ago);
++    else if (ago < 7200) snprintf(as, sizeof(as), "%lum", ago / 60);
++    else                 snprintf(as, sizeof(as), "%luh", ago / 3600);
++#else
+     char ps[8];
+     snprintf(ps, sizeof(ps), "%d%%", batPct);
+     int x = SCREEN_W - 4 - (int)strlen(ps) * 6;
+@@ -741,6 +797,7 @@ static void drawHeaderRight(GFX& g, int rssi, unsigned long ago, int batPct) {
+ 
+     char as[12];
+     snprintf(as, sizeof(as), "%lus", ago);
++#endif
+     g.setCursor(x - 6 - (int)strlen(as) * 6, 5);
+     g.print(as);
+ }
+@@ -758,7 +815,11 @@ template <class GFX>
+ static void drawScreenHeader(GFX& g, unsigned long lastFetchMs, int rssi) {
+     g.fillRect(0, 0, SCREEN_W, 18, C_HEAD);
+     drawHeaderLeft(g);
++#ifdef CUSTOM_SY
++    drawHeaderRight(g, rssi, dataAgeS(lastFetchMs), halBatPercent());
++#else
+     drawHeaderRight(g, rssi, (millis() - lastFetchMs) / 1000, halBatPercent());
++#endif
+ }
+ 
+ void uiChartScreen(const HistSlot* slots, uint32_t newestEpoch,
+@@ -985,6 +1046,9 @@ void uiInit() {
+ }
+ 
+ void uiBootProgress(int percent, const char* label) {
++#ifdef CUSTOM_SY
++    if (s_quietBoot) return;
++#endif
+     halClear(C_BG);
+ 
+     lcd.setTextColor(C_ACCENT, C_BG);
+@@ -1183,6 +1247,9 @@ void uiPinScreen(int pos, const int digits[4]) {
+ }
+ 
+ void uiConnecting(const char* ssid, int attempt) {
++#ifdef CUSTOM_SY
++    if (s_quietBoot) return;
++#endif
+     halClear(C_BG);
+     lcd.setTextColor(C_DIM, C_BG);
+     lcd.setTextSize(TS(1));
+@@ -1223,7 +1290,11 @@ void uiDashboard(const UsageData& data, unsigned long lastFetchMs, int rssi, int
+     g.print("CLAUDE USAGE");
+ #endif
+ 
++#ifdef CUSTOM_SY
++    unsigned long ago = dataAgeS(lastFetchMs);
++#else
+     unsigned long ago = (millis() - lastFetchMs) / 1000;
++#endif
+ #ifdef MANGO_UI
+     drawHeaderRight(g, rssi, ago, batPct);
+ #else
+@@ -1326,7 +1397,11 @@ void uiDashboardClock(const UsageData& data, unsigned long lastFetchMs, int rssi
+ #endif
+ 
+     // Header "rssi / ago": repaint the header band over its own colour.
++#ifdef CUSTOM_SY
++    unsigned long ago = dataAgeS(lastFetchMs);
++#else
+     unsigned long ago = (millis() - lastFetchMs) / 1000;
++#endif
+ #ifdef DUST_UI
+     // Repaint the left text with the current phase — screensTick() owns the
+     // label ↔ URL alternation via uiHeaderAlternate().
+diff --git a/src/ui.h b/src/ui.h
+index 1b642b1..652b1f9 100644
+--- a/src/ui.h
++++ b/src/ui.h
+@@ -36,6 +36,18 @@ void uiChartScreen(const HistSlot* slots, uint32_t newestEpoch,
+ void uiNewsScreen(const NewsState& news, unsigned long lastFetchMs, int rssi);
+ void uiClockScreen(const UsageData& data, unsigned long lastFetchMs, int rssi);
+ #endif
++#ifdef CUSTOM_SY
++// While on, boot-progress and WiFi-connecting screens are skipped so the
++// dashboard (cached numbers) stays up through boot and later reconnects.
++void uiSetQuietBoot(bool quiet);
++// Records when the numbers on screen were fetched: wall-clock epoch (0 if the
++// clock wasn't synced) and/or millis() (0 if unknown, e.g. loaded from flash).
++// The header's age readout uses these instead of the last *attempt*.
++void uiMarkData(uint32_t epoch, unsigned long ms);
++// Header notice (replaces the label/URL while set) and whether bars draw dimmed.
++// Returns true when the dimming changed, so the caller can redraw.
++bool uiSetNotice(const char* notice, bool stale);
++#endif
+ #ifdef MANGO_UI
+ // Latest model health for the dashboard's mascot row; cached until the next call.
+ void uiSetModelStatus(const ModelStatus& s);
+diff --git a/web/panel/panel.html b/web/panel/panel.html
+index 475e873..81b7089 100644
+--- a/web/panel/panel.html
++++ b/web/panel/panel.html
+@@ -283,7 +283,7 @@
+     <button class="ghost" id="btnHist">Reload chart</button>
+   </section>
+ 
+-  <section class="card wide">
++  <section class="card wide" id="newsCard">
+     <h2>Anthropic news</h2>
+     <ul class="news" id="newsList"><li class="muted">Not fetched yet.</li></ul>
+   </section>
+@@ -318,6 +318,20 @@
+     <div class="status" id="wifiStatus"></div>
+   </section>
+ 
++  <section class="card wide">
++    <h2>Firmware update</h2>
++    <p class="muted" style="margin:0">Install a new build over WiFi &mdash; choose the
++       <b class="mono">firmware.bin</b> file. The device reboots when it finishes;
++       WiFi, token, PIN and settings are kept. Keep this page open until it says done.</p>
++    <div class="row2" style="align-items:end">
++      <div><label for="otaFile">Firmware file</label>
++      <input id="otaFile" type="file" accept=".bin"></div>
++      <button id="btnOta">Upload &amp; install</button>
++    </div>
++    <progress id="otaProg" max="100" value="0" style="width:100%;margin-top:10px" hidden></progress>
++    <div class="status" id="otaStatus"></div>
++  </section>
++
+   <section class="card wide">
+     <h2>Danger zone</h2>
+     <p class="muted" style="margin:0">Factory reset wipes WiFi, token, PIN and all settings.
+@@ -428,15 +442,39 @@ function fmtUptime(s) {
+   return (d ? d + 'd ' : '') + h + 'h ' + m + 'm';
+ }
+ 
+-/* ── timezone options: -12:00 … +14:00 in 30-min steps ── */
++/* ── timezone options: named zones that follow daylight saving (custom build),
++   then fixed GMT offsets -12:00 … +14:00 in 30-min steps ── */
++const TZ_ZONES = [
++  ['US Pacific (auto DST)',  'PST8PDT,M3.2.0,M11.1.0'],
++  ['US Mountain (auto DST)', 'MST7MDT,M3.2.0,M11.1.0'],
++  ['US Arizona (no DST)',    'MST7'],
++  ['US Central (auto DST)',  'CST6CDT,M3.2.0,M11.1.0'],
++  ['US Eastern (auto DST)',  'EST5EDT,M3.2.0,M11.1.0'],
++  ['US Alaska (auto DST)',   'AKST9AKDT,M3.2.0,M11.1.0'],
++  ['Hawaii (no DST)',        'HST10'],
++  ['UK / Ireland (auto DST)','GMT0BST,M3.5.0/1,M10.5.0'],
++  ['Central Europe (auto DST)','CET-1CEST,M3.5.0,M10.5.0/3'],
++];
+ (function () {
+   const sel = $('selTz');
++  const g1 = document.createElement('optgroup');
++  g1.label = 'Follows daylight saving';
++  TZ_ZONES.forEach(([name, rule]) => {
++    const o = document.createElement('option');
++    o.value = 'z:' + rule;
++    o.textContent = name;
++    g1.appendChild(o);
++  });
++  sel.appendChild(g1);
++  const g2 = document.createElement('optgroup');
++  g2.label = 'Fixed offset';
++  sel.appendChild(g2);
+   for (let m = -720; m <= 840; m += 30) {
+     const o = document.createElement('option');
+     const a = Math.abs(m);
+     o.value = m;
+     o.textContent = 'GMT' + (m < 0 ? '-' : '+') + (a / 60 | 0) + (a % 60 ? ':30' : '');
+-    sel.appendChild(o);
++    g2.appendChild(o);
+   }
+ })();
+ 
+@@ -505,11 +543,12 @@ function render(s) {
+     const c = s.settings || {};
+     $('selBright').value = c.brightness;
+     $('selPoll').value = c.poll_sec;
+-    $('selTz').value = c.tz_min;
++    $('selTz').value = c.tz_posix ? 'z:' + c.tz_posix : c.tz_min;
+     $('inName').value = c.dev_name || '';
+     $('selMode').value = c.ui_mode ?? 0;
+     $('selDwell').value = c.dwell_s ?? 10;
+     maskSet('scrChecks', c.scr_mask ?? 7);
++    $('newsCard').hidden = !((c.scr_mask ?? 7) & 4);
+     maskSet('mdlChecks', c.mdl_mask ?? 15);
+   }
+ 
+@@ -614,9 +653,11 @@ $('btnSettings').onclick = () => {
+   const body = {
+     brightness: +$('selBright').value,
+     poll_sec: +$('selPoll').value,
+-    tz_min: +$('selTz').value,
+     dev_name: $('inName').value.trim(),
+   };
++  const tz = $('selTz').value;
++  if (tz.startsWith('z:')) body.tz_posix = tz.slice(2);
++  else body.tz_min = +tz;
+   api('/api/settings', body).then(r => {
+     dirty = false;
+     toast('setStatus', r.hostname_pending_reboot
+@@ -624,6 +665,49 @@ $('btnSettings').onclick = () => {
+   }).catch(x => toast('setStatus', x.message));
+ };
+ 
++/* ── wireless firmware update (custom build) ── */
++$('btnOta').onclick = () => {
++  const f = $('otaFile').files[0];
++  if (!f) return toast('otaStatus', 'Choose a firmware .bin file first.');
++  if (!/\.bin$/i.test(f.name)) return toast('otaStatus', 'That isn\'t a .bin file.');
++  const fd = new FormData();
++  fd.append('fw', f, f.name);
++  const x = new XMLHttpRequest();
++  x.open('POST', '/api/ota');
++  x.setRequestHeader('X-OTA', '1');   // a cross-site form can't set this
++  const pr = $('otaProg');
++  pr.hidden = false; pr.value = 0;
++  $('btnOta').disabled = true;
++  $('otaStatus').className = 'status';
++  $('otaStatus').textContent = 'Uploading...';
++  x.upload.onprogress = e => {
++    if (e.lengthComputable) pr.value = e.loaded * 100 / e.total;
++    if (e.loaded === e.total) $('otaStatus').textContent = 'Installing...';
++  };
++  x.onload = () => {
++    $('btnOta').disabled = false;
++    if (x.status === 200) {
++      pr.value = 100;
++      $('otaStatus').className = 'status okc';
++      $('otaStatus').textContent = 'Done. Rebooting \u2014 this page reloads in about 30 seconds.';
++      setTimeout(() => location.reload(), 30000);
++      return;
++    }
++    pr.hidden = true;
++    let why = '';
++    try { why = JSON.parse(x.responseText).error; } catch (e) {}
++    if (x.status === 401) { showLogin(); return; }
++    const msg = why === 'not_esp32s3_image' ? 'That file isn\'t firmware for this board.' : 'Update failed' + (why ? ': ' + why : '.');
++    toast('otaStatus', msg);
++  };
++  x.onerror = () => {
++    $('btnOta').disabled = false;
++    pr.hidden = true;
++    toast('otaStatus', 'Upload failed \u2014 connection lost.');
++  };
++  x.send(fd);
++};
++
+ $('btnFlip').onclick = () =>
+   api('/api/settings', { flip: 'toggle' }).then(() => toast('setStatus', 'Flipped.', true))
+     .catch(x => toast('setStatus', x.message));
